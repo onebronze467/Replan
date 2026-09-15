@@ -1,25 +1,24 @@
-# RePlan — 실시간 여행 재설계 AI 가이드
+# RePlan v2 — 실시간 여행 재설계 가이드
 
-2026 관광데이터 활용 공모전 웹·앱 구현 부문 지정과제 1용 배포-ready 프로토타입입니다.
+## 무엇이 개선됐나요?
+- 한국관광공사 TourAPI 실제 관광지 조회
+- 주변 추천 결과를 기억하고 혼잡 우회 시 기존 장소 제외
+- 관광지·문화시설·행사 후보를 섞어 대체 장소 검색
+- `예상 혼잡도`로 표현을 정정하여 실제 측정값과 혼동 방지
+- 우천 상황 문구와 추천 결과 일치
+- 추천 카드에서 `일정에 담기`를 눌러 간단한 시간표 생성
+- API 실패 시 가짜 샘플을 보여주지 않고 오류를 명확히 표시
+- 로그인 없이 사용
 
-## 핵심 가치
-여행 중 혼잡·날씨·동선 문제가 생겼을 때 사용자가 상황을 말하면, 현재 위치 주변의 대체 관광지를 다시 찾아 여행 계획을 바꿀 수 있습니다.
+## 사용 API
+- 필수: 한국관광공사 국문 관광정보 서비스_GW (`locationBasedList2`, `detailCommon2`)
+- 무료·키 없음: Open-Meteo Forecast API
 
-## 구성
-- FastAPI 단일 웹서비스: `app/main.py`
-- 정적 프론트엔드: `app/static/index.html`
-- 필수 인증키 1개: 한국관광공사 TourAPI `TOUR_API_KEY`
-- 키 불필요 외부 API: Open-Meteo 날씨 API
-- 로그인 없음
+## 배포
+Vercel Python 배포 구조입니다. Vercel 환경변수에 다음을 등록합니다.
 
-## 로컬 실행
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export TOUR_API_KEY='공공데이터포털 서비스키'
-uvicorn app.main:app --reload --port 8000
+```text
+TOUR_API_KEY=공공데이터포털 일반 인증키(Decoding)
 ```
-브라우저에서 `http://localhost:8000`을 엽니다.
 
-자세한 배포 방법은 `DEPLOY.md`를 확인하세요.
+환경변수 저장 후 Redeploy하고 `/health`에서 `tour_api_configured: true`를 확인합니다.

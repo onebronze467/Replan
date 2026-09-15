@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: replan
-    runtime: docker
-    plan: free
-    healthCheckPath: /health
-    envVars:
-      - key: TOUR_API_KEY
-        sync: false

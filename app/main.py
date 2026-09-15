@@ -1,109 +1,290 @@
-"""RePlan production-ready single-service app.
-Required key: TOUR_API_KEY (data.go.kr Korean Tourism Organization TourAPI).
-Weather: Open-Meteo public forecast API, no key required.
-"""
-import os, datetime, math
-from typing import Any
+"""RePlan API: a context-aware travel replanning demo for Vercel."""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import unquote
+from zoneinfo import ZoneInfo
+
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-TOUR_KEY=os.getenv("TOUR_API_KEY","").strip()
-TOUR_BASE="https://apis.data.go.kr/B551011/KorService2"
-OPEN_METEO="https://api.open-meteo.com/v1/forecast"
-app=FastAPI(title="RePlan", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+TOUR_KEY = unquote(os.getenv("TOUR_API_KEY", "").strip())
+TOUR_BASE = "https://apis.data.go.kr/B551011/KorService2"
+METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+KST = ZoneInfo("Asia/Seoul")
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+logger = logging.getLogger("replan")
+
+app = FastAPI(title="RePlan", version="2.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
+REGION_CENTERS: tuple[tuple[str, float, float], ...] = (
+    ("서울 종로구", 37.5735, 126.9790),
+    ("서울 중구", 37.5641, 126.9979),
+    ("서울 강남구", 37.5172, 127.0473),
+    ("부산 해운대", 35.1631, 129.1635),
+    ("제주 서귀포", 33.2541, 126.5601),
+    ("강릉", 37.7519, 128.8761),
+    ("경주", 35.8562, 129.2247),
+    ("전주", 35.8242, 127.1480),
+    ("여수", 34.7604, 127.6622),
+    ("속초", 38.2070, 128.5918),
+    ("춘천", 37.8813, 127.7298),
+    ("서울", 37.5665, 126.9780),
+    ("부산", 35.1796, 129.0756),
+    ("대구", 35.8714, 128.6014),
+    ("인천", 37.4563, 126.7052),
+    ("광주", 35.1595, 126.8526),
+    ("대전", 36.3504, 127.3845),
+    ("울산", 35.5384, 129.3114),
+    ("세종", 36.4800, 127.2890),
+    ("제주", 33.4996, 126.5312),
+)
+
+STYLE_CONTENT_TYPES = {
+    "문화·역사": (14, 12),
+    "카페·휴식": (39, 12),
+    "자연·산책": (12, 28),
+    "맛집": (39,),
+}
+
 
 class ChatReq(BaseModel):
-    message:str=Field(min_length=1,max_length=500)
-    lat:float=37.5665
-    lng:float=126.9780
-    history:list[dict[str,Any]]=[]
+    message: str = Field(min_length=1, max_length=500)
+    lat: float = Field(default=37.5665, ge=-90, le=90)
+    lng: float = Field(default=126.9780, ge=-180, le=180)
+    region: str = Field(default="", max_length=80)
+    travel_date: Optional[dt.date] = None
+    style: str = Field(default="문화·역사", max_length=30)
+    exclude_ids: list[str] = Field(default_factory=list)
 
-async def json_get(url:str, params:dict):
+
+class ScheduleReq(BaseModel):
+    cards: list[dict[str, Any]] = Field(default_factory=list)
+    start_hour: int = Field(default=10, ge=0, le=23)
+
+
+async def get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            r=await client.get(url,params=params); r.raise_for_status(); return r.json()
-    except Exception as e:
-        raise HTTPException(502,f"외부 API 호출 실패: {type(e).__name__}")
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+    except httpx.TimeoutException as exc:
+        logger.warning("External API timeout: %s", url)
+        raise HTTPException(504, "관광정보 서버의 응답이 늦어지고 있습니다.") from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("External API failure for %s: %s", url, type(exc).__name__)
+        raise HTTPException(502, "외부 관광정보를 불러오지 못했습니다.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(502, "외부 관광정보의 응답 형식이 올바르지 않습니다.")
+    return data
 
-def items_from(data:dict)->list[dict]:
+
+def rows(data: dict[str, Any]) -> list[dict[str, Any]]:
     try:
-        items=data["response"]["body"]["items"]
-        if not items:return []
-        item=items.get("item",[])
-        return item if isinstance(item,list) else [item]
-    except (KeyError,TypeError):return []
+        header = data["response"]["header"]
+        if str(header.get("resultCode", "0000")) != "0000":
+            raise HTTPException(502, header.get("resultMsg", "TourAPI 요청에 실패했습니다."))
+        raw = data["response"]["body"]["items"]
+        if not raw:
+            return []
+        item = raw.get("item", [])
+        return item if isinstance(item, list) else [item]
+    except HTTPException:
+        raise
+    except (KeyError, TypeError) as exc:
+        raise HTTPException(502, "TourAPI 응답을 해석하지 못했습니다.") from exc
 
-async def tour_get(path:str, **params):
-    if not TOUR_KEY: raise HTTPException(503,"TOUR_API_KEY가 설정되지 않았습니다.")
-    base={"serviceKey":TOUR_KEY,"MobileOS":"ETC","MobileApp":"RePlan","_type":"json"}
-    data=await json_get(f"{TOUR_BASE}/{path}",{**base,**params})
-    return items_from(data)
 
-def place(i:dict)->dict:
-    try: dist=round(float(i.get("dist",0)))
-    except: dist=0
-    return {"title":i.get("title","관광지"),"addr":i.get("addr1", ""),"img":i.get("firstimage", ""),"dist":dist,"lat":i.get("mapy"),"lng":i.get("mapx"),"contentid":i.get("contentid"),"contenttypeid":i.get("contenttypeid")}
+async def tour(path: str, **params: Any) -> list[dict[str, Any]]:
+    if not TOUR_KEY:
+        raise HTTPException(503, "TOUR_API_KEY가 설정되지 않았습니다.")
+    base = {
+        "serviceKey": TOUR_KEY,
+        "MobileOS": "ETC",
+        "MobileApp": "RePlan",
+        "_type": "json",
+    }
+    return rows(await get_json(f"{TOUR_BASE}/{path}", {**base, **params}))
 
-def score(p:dict, now=None)->float:
-    now=now or datetime.datetime.now(); x=40.0
-    if now.weekday()>=5:x+=25
-    if 11<=now.hour<=16:x+=18
-    if p.get("dist",9999)<1000:x+=5
-    return min(round(x,1),100)
 
-def weather_label(code:int)->str:
-    if code in [0,1]: return "맑음"
-    if code in [2,3]: return "구름 많음"
-    if code in [45,48]: return "안개"
-    if code in [51,53,55,56,57]: return "이슬비"
-    if code in [61,63,65,66,67,80,81,82]: return "비"
-    if code in [71,73,75,77,85,86]: return "눈"
-    if code in [95,96,99]: return "천둥·번개"
-    return "날씨 정보"
+def convert(item: dict[str, Any]) -> dict[str, Any]:
+    try:
+        distance = round(float(item.get("dist", 0)))
+    except (TypeError, ValueError):
+        distance = 0
+    image = item.get("firstimage") or item.get("firstimage2") or ""
+    if image.startswith("http://"):
+        image = "https://" + image.removeprefix("http://")
+    return {
+        "title": item.get("title") or "관광지",
+        "addr": item.get("addr1") or "",
+        "img": image,
+        "dist": distance,
+        "lat": item.get("mapy"),
+        "lng": item.get("mapx"),
+        "contentid": str(item.get("contentid") or ""),
+        "contenttypeid": str(item.get("contenttypeid") or ""),
+    }
+
+
+def resolve_location(region: str, lat: float, lng: float) -> tuple[float, float, str]:
+    normalized = " ".join(region.strip().split())
+    for name, center_lat, center_lng in REGION_CENTERS:
+        if normalized and (name in normalized or normalized in name):
+            return center_lat, center_lng, name
+    return lat, lng, normalized or "현재 위치"
+
+
+def estimate_time(travel_date: Optional[dt.date]) -> dt.datetime:
+    now = dt.datetime.now(KST)
+    if travel_date and travel_date != now.date():
+        return dt.datetime.combine(travel_date, dt.time(13, 0), tzinfo=KST)
+    return now
+
+
+def estimated_crowding(distance: int, when: dt.datetime) -> float:
+    value = 28.0 + (20 if when.weekday() >= 5 else 0) + (18 if 11 <= when.hour <= 16 else 0)
+    value += min(12, max(0, (2500 - distance) / 250))
+    return round(min(95, value), 1)
+
+
+def enrich(items: list[dict[str, Any]], travel_date: Optional[dt.date] = None) -> list[dict[str, Any]]:
+    when = estimate_time(travel_date)
+    for place in items:
+        place["congestion"] = estimated_crowding(place.get("dist", 0), when)
+        place["congestion_basis"] = "요일·시간대·거리 기반 예상치"
+    return items
+
+
+def unique(items: list[dict[str, Any]], excluded: set[str]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen = set(excluded)
+    for place in items:
+        content_id = place.get("contentid")
+        if content_id and content_id not in seen:
+            seen.add(content_id)
+            result.append(place)
+    return result
+
+
+def weather_name(code: int) -> str:
+    if code in (0, 1): return "맑음"
+    if code in (2, 3): return "구름 많음"
+    if code in (45, 48): return "안개"
+    if code in (51, 53, 55, 56, 57): return "이슬비"
+    if code in (61, 63, 65, 66, 67, 80, 81, 82): return "비"
+    if code in (71, 73, 75, 77, 85, 86): return "눈"
+    if code in (95, 96, 99): return "천둥·번개"
+    return "날씨 정보 없음"
+
+
+async def nearby_raw(lat: float, lng: float, radius: int, content_type: int, count: int = 20) -> list[dict[str, Any]]:
+    items = await tour(
+        "locationBasedList2", mapX=lng, mapY=lat,
+        radius=max(500, min(radius, 20_000)), contentTypeId=content_type,
+        arrange="E", numOfRows=count, pageNo=1,
+    )
+    return [convert(item) for item in items]
+
+
+async def recommendations(lat: float, lng: float, style: str, travel_date: Optional[dt.date], excluded: set[str], radius: int = 6000) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for content_type in STYLE_CONTENT_TYPES.get(style, (12, 14)):
+        candidates.extend(await nearby_raw(lat, lng, radius, content_type, 16))
+    return enrich(unique(candidates, excluded), travel_date)[:8]
+
 
 @app.get("/health")
-def health():
-    return {"ok":True,"tour_api_configured":bool(TOUR_KEY),"weather_api":"Open-Meteo","version":"1.0.0"}
+def health() -> dict[str, Any]:
+    return {"ok": True, "tour_api_configured": bool(TOUR_KEY), "weather_api": "Open-Meteo", "version": app.version}
+
 
 @app.get("/api/weather")
-async def weather(lat:float=Query(37.5665),lng:float=Query(126.9780)):
-    data=await json_get(OPEN_METEO,{"latitude":lat,"longitude":lng,"current":"temperature_2m,precipitation,rain,weather_code,wind_speed_10m","timezone":"Asia/Seoul"})
-    c=data.get("current",{})
-    return {"temperature":c.get("temperature_2m"),"precipitation":c.get("precipitation"),"rain":c.get("rain"),"weather_code":c.get("weather_code"),"label":weather_label(int(c.get("weather_code",-1))),"wind_speed":c.get("wind_speed_10m")}
+async def weather(lat: float = 37.5665, lng: float = 126.9780) -> dict[str, Any]:
+    current = (await get_json(METEO_BASE, {
+        "latitude": lat, "longitude": lng,
+        "current": "temperature_2m,precipitation,rain,weather_code,wind_speed_10m",
+        "timezone": "Asia/Seoul",
+    })).get("current", {})
+    code = int(current.get("weather_code", -1))
+    return {
+        "temperature": current.get("temperature_2m"), "precipitation": current.get("precipitation"),
+        "rain": current.get("rain"), "weather_code": code, "label": weather_name(code),
+        "wind_speed": current.get("wind_speed_10m"),
+    }
+
 
 @app.get("/api/nearby")
-async def nearby(lat:float=37.5665,lng:float=126.9780,radius:int=3000,content_type:int=12):
-    rows=await tour_get("locationBasedList2",mapX=lng,mapY=lat,radius=max(500,min(radius,20000)),contentTypeId=content_type,arrange="E",numOfRows=10)
-    return [{**place(i),"congestion":score(place(i))} for i in rows]
+async def nearby(lat: float = 37.5665, lng: float = 126.9780, radius: int = 3000, content_type: int = 12) -> list[dict[str, Any]]:
+    return enrich((await nearby_raw(lat, lng, radius, content_type))[:10])
 
-@app.get("/api/detour")
-async def detour(lat:float=37.5665,lng:float=126.9780):
-    rows=await nearby(lat,lng,8000,12)
-    return {"quiet_alternatives":sorted(rows,key=lambda p:(p["congestion"],p["dist"]))[:5]}
 
 @app.get("/api/detail/{content_id}")
-async def detail(content_id:str):
-    common=await tour_get("detailCommon2",contentId=content_id,defaultYN="Y",firstImageYN="Y",overviewYN="Y",addrinfoYN="Y",mapinfoYN="Y",numOfRows=1)
-    return place(common[0]) if common else {}
+async def detail(content_id: str) -> dict[str, Any]:
+    items = await tour("detailCommon2", contentId=content_id, defaultYN="Y", firstImageYN="Y", overviewYN="Y", addrinfoYN="Y", mapinfoYN="Y", numOfRows=1, pageNo=1)
+    return items[0] if items else {}
+
+
+@app.post("/api/schedule")
+async def schedule(req: ScheduleReq) -> dict[str, Any]:
+    selected = [item for item in req.cards if item.get("title")][:6]
+    if not selected:
+        raise HTTPException(422, "일정에 담긴 장소가 없습니다.")
+    plan = []
+    for index, place in enumerate(selected):
+        total_minutes = req.start_hour * 60 + index * 120
+        hour, minute = divmod(total_minutes, 60)
+        plan.append({"time": f"{hour % 24:02d}:{minute:02d}", "title": place.get("title"), "addr": place.get("addr"), "contentid": place.get("contentid")})
+    return {"title": "선택 장소로 만든 추천 일정", "items": plan}
+
 
 @app.post("/api/chat")
-async def chat(req:ChatReq):
-    m=req.message
-    if any(k in m for k in ["혼잡","붐비","사람 많","복잡","줄이 길"]):
-        return {"type":"cards","title":"혼잡 우회 추천","text":"현재 주변이 혼잡하군요. 상대적으로 여유로운 대안 관광지를 추천해드릴게요.","cards":(await detour(req.lat,req.lng))["quiet_alternatives"]}
-    if any(k in m for k in ["비","날씨","우천","눈"]):
-        w=await weather(req.lat,req.lng)
-        indoor=[place(i) for i in await tour_get("locationBasedList2",mapX=req.lng,mapY=req.lat,radius=5000,contentTypeId=14,arrange="E",numOfRows=10)]
-        indoor=[{**p,"congestion":score(p)} for p in indoor]
-        return {"type":"cards","title":"날씨 대응 추천","text":f"현재 날씨는 {w['label']}입니다. 실내 문화시설을 중심으로 대안을 추천해드릴게요.","weather":w,"cards":indoor[:5]}
-    rows=[place(i) for i in await tour_get("locationBasedList2",mapX=req.lng,mapY=req.lat,radius=3000,contentTypeId=12,arrange="E",numOfRows=10)]
-    return {"type":"cards","title":"주변 관광지 추천","text":"현재 위치 주변 관광지를 찾아드렸어요.","cards":[{**p,"congestion":score(p)} for p in rows[:5]]}
+async def chat(req: ChatReq) -> dict[str, Any]:
+    message = req.message.lower()
+    excluded = {str(item) for item in req.exclude_ids}
+    lat, lng, applied_region = resolve_location(req.region, req.lat, req.lng)
+    is_crowded = any(word in message for word in ("혼잡", "붐비", "사람 많", "복잡", "줄이 길"))
+    is_weather = any(word in message for word in ("비가", "비 와", "비와", "우천", "눈이", "날씨", "더워", "추워"))
+    is_schedule = any(word in message for word in ("일정", "동선", "코스", "다시 짜", "재설계"))
 
-app.mount("/static",StaticFiles(directory="app/static"),name="static")
-@app.get("/",include_in_schema=False)
-def index():return FileResponse("app/static/index.html")
+    if is_crowded:
+        candidates: list[dict[str, Any]] = []
+        for content_type in (12, 14, 15, 28):
+            candidates.extend(await nearby_raw(lat, lng, 9000, content_type, 20))
+        alternatives = unique(candidates, excluded)
+        alternatives = sorted(enrich(alternatives, req.travel_date), key=lambda item: (item["congestion"], item["dist"]))[:6]
+        return {"type": "detour", "title": "혼잡 우회 추천", "text": f"{applied_region}에서 기존 장소를 제외하고 비교적 여유로운 대안을 찾았어요.", "cards": alternatives, "applied_region": applied_region}
+
+    if is_weather:
+        current_weather = await weather(lat, lng)
+        indoor = unique(await nearby_raw(lat, lng, 8000, 14, 20), excluded)[:6]
+        return {"type": "weather", "title": "날씨 대응 추천", "text": f"{applied_region}의 현재 날씨는 {current_weather['label']}예요. 실내 문화시설 중심으로 대안을 찾았습니다.", "weather": current_weather, "cards": enrich(indoor, req.travel_date), "applied_region": applied_region}
+
+    cards = await recommendations(lat, lng, req.style, req.travel_date, excluded)
+    text = f"{applied_region}의 선택 장소를 바탕으로 일정을 다시 구성할 수 있어요. 먼저 원하는 장소를 담아주세요." if is_schedule else f"{applied_region}에서 ‘{req.style}’ 취향에 맞는 장소를 찾았어요."
+    return {"type": "schedule_candidates" if is_schedule else "nearby", "title": "일정 후보" if is_schedule else "주변 관광지 추천", "text": text, "cards": cards[:6], "applied_region": applied_region}
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")

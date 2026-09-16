@@ -17,7 +17,7 @@
 - 무료·키 없음: Open-Meteo Forecast API
 
 ## 배포
-Vercel Python 배포 구조입니다. Vercel 환경변수에 다음을 등록합니다.
+루트 `index.py`가 Vercel의 FastAPI 진입점입니다. 별도 rewrite 설정 없이 저장소 루트를 배포하고, Vercel 환경변수에 다음을 등록합니다.
 
 ```text
 TOUR_API_KEY=공공데이터포털 일반 인증키(Decoding)

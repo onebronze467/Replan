@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -25,7 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 logger = logging.getLogger("replan")
 
-app = FastAPI(title="RePlan", version="2.1.0")
+app = FastAPI(title="RePlan", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -149,7 +150,10 @@ def resolve_location(region: str, lat: float, lng: float) -> tuple[float, float,
     for name, center_lat, center_lng in REGION_CENTERS:
         if normalized and (name in normalized or normalized in name):
             return center_lat, center_lng, name
-    return lat, lng, normalized or "현재 위치"
+    if normalized:
+        supported = ", ".join(name for name, _, _ in REGION_CENTERS[:11])
+        raise HTTPException(422, f"아직 지원하지 않는 지역입니다. 지원 지역: {supported}")
+    return lat, lng, "기본 위치"
 
 
 def estimate_time(travel_date: Optional[dt.date]) -> dt.datetime:
@@ -182,6 +186,41 @@ def unique(items: list[dict[str, Any]], excluded: set[str]) -> list[dict[str, An
             seen.add(content_id)
             result.append(place)
     return result
+
+
+def coordinates(place: dict[str, Any]) -> Optional[tuple[float, float]]:
+    try:
+        return float(place["lat"]), float(place["lng"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def distance_m(left: dict[str, Any], right: dict[str, Any]) -> Optional[int]:
+    start = coordinates(left)
+    end = coordinates(right)
+    if not start or not end:
+        return None
+    lat1, lng1 = map(math.radians, start)
+    lat2, lng2 = map(math.radians, end)
+    dlat, dlng = lat2 - lat1, lng2 - lng1
+    value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
+    return round(6_371_000 * 2 * math.atan2(math.sqrt(value), math.sqrt(1 - value)))
+
+
+def optimize_route(places: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the first selected stop, then visit the nearest remaining stop."""
+    if len(places) < 3:
+        return places
+    route = [places[0]]
+    remaining = places[1:]
+    while remaining:
+        current = route[-1]
+        next_index = min(
+            range(len(remaining)),
+            key=lambda index: distance_m(current, remaining[index]) or 10**12,
+        )
+        route.append(remaining.pop(next_index))
+    return route
 
 
 def weather_name(code: int) -> str:
@@ -247,12 +286,27 @@ async def schedule(req: ScheduleReq) -> dict[str, Any]:
     selected = [item for item in req.cards if item.get("title")][:6]
     if not selected:
         raise HTTPException(422, "일정에 담긴 장소가 없습니다.")
+    selected = optimize_route(selected)
     plan = []
+    total_distance = 0
     for index, place in enumerate(selected):
         total_minutes = req.start_hour * 60 + index * 120
         hour, minute = divmod(total_minutes, 60)
-        plan.append({"time": f"{hour % 24:02d}:{minute:02d}", "title": place.get("title"), "addr": place.get("addr"), "contentid": place.get("contentid")})
-    return {"title": "선택 장소로 만든 추천 일정", "items": plan}
+        leg_distance = distance_m(selected[index - 1], place) if index else None
+        total_distance += leg_distance or 0
+        plan.append({
+            "time": f"{hour % 24:02d}:{minute:02d}",
+            "title": place.get("title"),
+            "addr": place.get("addr"),
+            "contentid": place.get("contentid"),
+            "leg_distance_m": leg_distance,
+        })
+    return {
+        "title": "이동 거리를 줄인 재설계 일정",
+        "text": "첫 장소는 유지하고 이후 장소를 가까운 순서로 재배치했습니다.",
+        "total_distance_m": total_distance,
+        "items": plan,
+    }
 
 
 @app.post("/api/chat")
@@ -261,8 +315,29 @@ async def chat(req: ChatReq) -> dict[str, Any]:
     excluded = {str(item) for item in req.exclude_ids}
     lat, lng, applied_region = resolve_location(req.region, req.lat, req.lng)
     is_crowded = any(word in message for word in ("혼잡", "붐비", "사람 많", "복잡", "줄이 길"))
-    is_weather = any(word in message for word in ("비가", "비 와", "비와", "우천", "눈이", "날씨", "더워", "추워"))
+    is_weather = any(word in message for word in ("비", "우천", "눈", "날씨", "더워", "추워", "폭염", "한파"))
     is_schedule = any(word in message for word in ("일정", "동선", "코스", "다시 짜", "재설계"))
+
+    if is_crowded and is_weather:
+        current_weather = None
+        try:
+            current_weather = await weather(lat, lng)
+        except HTTPException:
+            pass
+        indoor = unique(await nearby_raw(lat, lng, 9000, 14, 30), excluded)
+        alternatives = sorted(
+            enrich(indoor, req.travel_date),
+            key=lambda item: (item["congestion"], item["dist"]),
+        )[:6]
+        observed = f" 참고 관측 날씨는 {current_weather['label']}입니다." if current_weather else ""
+        return {
+            "type": "weather_detour",
+            "title": "우천·혼잡 동시 대응 추천",
+            "text": f"말씀해주신 현장 상황을 우선 반영해 {applied_region}의 실내 장소 중 예상 혼잡 점수가 낮은 대안을 찾았어요.{observed}",
+            "weather": current_weather,
+            "cards": alternatives,
+            "applied_region": applied_region,
+        }
 
     if is_crowded:
         candidates: list[dict[str, Any]] = []
@@ -270,12 +345,17 @@ async def chat(req: ChatReq) -> dict[str, Any]:
             candidates.extend(await nearby_raw(lat, lng, 9000, content_type, 20))
         alternatives = unique(candidates, excluded)
         alternatives = sorted(enrich(alternatives, req.travel_date), key=lambda item: (item["congestion"], item["dist"]))[:6]
-        return {"type": "detour", "title": "혼잡 우회 추천", "text": f"{applied_region}에서 기존 장소를 제외하고 비교적 여유로운 대안을 찾았어요.", "cards": alternatives, "applied_region": applied_region}
+        return {"type": "detour", "title": "혼잡 우회 추천", "text": f"{applied_region}에서 기존 장소를 제외하고 예상 혼잡 점수가 낮은 대안을 찾았어요.", "cards": alternatives, "applied_region": applied_region}
 
     if is_weather:
-        current_weather = await weather(lat, lng)
+        current_weather = None
+        try:
+            current_weather = await weather(lat, lng)
+        except HTTPException:
+            pass
         indoor = unique(await nearby_raw(lat, lng, 8000, 14, 20), excluded)[:6]
-        return {"type": "weather", "title": "날씨 대응 추천", "text": f"{applied_region}의 현재 날씨는 {current_weather['label']}예요. 실내 문화시설 중심으로 대안을 찾았습니다.", "weather": current_weather, "cards": enrich(indoor, req.travel_date), "applied_region": applied_region}
+        observed = f" 참고 관측 날씨는 {current_weather['label']}입니다." if current_weather else ""
+        return {"type": "weather", "title": "날씨 대응 추천", "text": f"말씀해주신 현장 날씨를 우선 반영해 {applied_region}의 실내 문화시설을 찾았어요.{observed}", "weather": current_weather, "cards": enrich(indoor, req.travel_date), "applied_region": applied_region}
 
     cards = await recommendations(lat, lng, req.style, req.travel_date, excluded)
     text = f"{applied_region}의 선택 장소를 바탕으로 일정을 다시 구성할 수 있어요. 먼저 원하는 장소를 담아주세요." if is_schedule else f"{applied_region}에서 ‘{req.style}’ 취향에 맞는 장소를 찾았어요."

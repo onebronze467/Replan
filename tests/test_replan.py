@@ -38,6 +38,21 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("현장 상황을 우선", result["text"])
         self.assertEqual(result["cards"][0]["title"], "실내 미술관")
 
+    async def test_colloquial_crowding_phrase_is_detected(self):
+        indoor = [{
+            "title": "실내 미술관", "addr": "서울", "dist": 300,
+            "lat": 37.57, "lng": 126.98, "contentid": "1",
+            "contenttypeid": "14", "img": "",
+        }]
+        request = main.ChatReq(message="비가 오고 너무 붐벼요", region="서울 종로구")
+
+        with patch.object(main, "nearby_raw", AsyncMock(return_value=indoor)), patch.object(
+            main, "weather", AsyncMock(return_value={"label": "맑음"})
+        ):
+            result = await main.chat(request)
+
+        self.assertEqual(result["type"], "weather_detour")
+
     def test_unknown_region_is_rejected_instead_of_using_wrong_coordinates(self):
         with self.assertRaises(HTTPException) as raised:
             main.resolve_location("없는 지역", 37.5, 127.0)

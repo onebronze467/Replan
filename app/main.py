@@ -26,7 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 logger = logging.getLogger("replan")
 
-app = FastAPI(title="RePlan", version="2.2.0")
+app = FastAPI(title="RePlan", version="2.2.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -314,7 +314,7 @@ async def chat(req: ChatReq) -> dict[str, Any]:
     message = req.message.lower()
     excluded = {str(item) for item in req.exclude_ids}
     lat, lng, applied_region = resolve_location(req.region, req.lat, req.lng)
-    is_crowded = any(word in message for word in ("혼잡", "붐비", "사람 많", "복잡", "줄이 길"))
+    is_crowded = any(word in message for word in ("혼잡", "붐비", "붐벼", "붐빔", "사람 많", "복잡", "줄이 길"))
     is_weather = any(word in message for word in ("비", "우천", "눈", "날씨", "더워", "추워", "폭염", "한파"))
     is_schedule = any(word in message for word in ("일정", "동선", "코스", "다시 짜", "재설계"))
 
